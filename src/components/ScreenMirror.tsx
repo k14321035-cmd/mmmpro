@@ -9,6 +9,15 @@ const ICE_SERVERS = {
   ],
 };
 
+const DEFAULT_SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://math-pro-jq8m.onrender.com';
+
+const getSocketServerUrl = () => {
+  if (typeof window !== 'undefined' && window.location.protocol.startsWith('http') && window.location.hostname !== 'localhost') {
+    return undefined;
+  }
+  return DEFAULT_SERVER_URL;
+};
+
 export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const [mode, setMode] = useState<'idle' | 'host' | 'join'>('idle');
   const [roomId, setRoomId] = useState('');
@@ -23,8 +32,8 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
-    // Connect to the signaling server (uses VITE_SERVER_URL for Capacitor Android or relative host for browser)
-    const serverUrl = import.meta.env.VITE_SERVER_URL || undefined;
+    // Connect to the signaling server (uses Render URL for Android Capacitor or relative host for browser)
+    const serverUrl = getSocketServerUrl();
     socketRef.current = serverUrl ? io(serverUrl) : io();
 
     const handleFullscreenChange = () => {
@@ -290,7 +299,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     setStatus('Idle');
     
     // Reconnect socket for next session
-    const serverUrl = import.meta.env.VITE_SERVER_URL || undefined;
+    const serverUrl = getSocketServerUrl();
     socketRef.current = serverUrl ? io(serverUrl) : io();
   };
 
