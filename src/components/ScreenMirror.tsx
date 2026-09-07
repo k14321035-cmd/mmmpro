@@ -161,20 +161,27 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     return id;
   };
 
+  const isDisplayMediaSupported = typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+
   const startHosting = async (sourceType: 'screen' | 'camera' = 'screen') => {
     try {
       setError('');
-      setStatus(`Requesting ${sourceType} access...`);
       let stream: MediaStream;
-      
-      if (sourceType === 'screen') {
+
+      if (sourceType === 'screen' && isDisplayMediaSupported) {
+        setStatus('Requesting screen access...');
         stream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
         });
       } else {
+        if (sourceType === 'screen' && !isDisplayMediaSupported) {
+          setStatus('Screen capture unavailable on mobile. Using camera...');
+        } else {
+          setStatus('Requesting camera access...');
+        }
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' }, // Try to get back camera by default
+          video: { facingMode: 'environment' }, // Default to back camera
           audio: true,
         });
       }
@@ -319,14 +326,19 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
             <div className="grid w-full sm:grid-cols-3 gap-6">
               <button
                 onClick={() => startHosting('screen')}
-                className="group flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-blue-500 hover:shadow-md hover:-translate-y-1"
+                className="group relative flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-blue-500 hover:shadow-md hover:-translate-y-1"
               >
+                {!isDisplayMediaSupported && (
+                  <span className="absolute top-3 right-3 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">
+                    Desktop
+                  </span>
+                )}
                 <div className="mb-4 rounded-2xl bg-blue-50 p-4 text-blue-600 group-hover:bg-blue-600 group-hover:text-white transition-colors">
                   <MonitorUp className="h-8 w-8" />
                 </div>
                 <h3 className="font-bold text-slate-900 text-lg">Screen Host</h3>
                 <p className="mt-2 text-center text-xs text-slate-500 leading-relaxed">
-                  Start transmitting the local display feed.
+                  {isDisplayMediaSupported ? 'Start transmitting the local display feed.' : 'Transmits screen on desktop, or camera on mobile.'}
                 </p>
               </button>
 

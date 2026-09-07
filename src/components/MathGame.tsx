@@ -20,7 +20,7 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
       setScanError('');
       
       let stream: MediaStream;
-      if (type === 'camera') {
+      if (type === 'camera' || typeof navigator?.mediaDevices?.getDisplayMedia !== 'function') {
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
       } else {
         stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
