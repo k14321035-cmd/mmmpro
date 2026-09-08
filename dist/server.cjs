@@ -48,6 +48,11 @@ async function startServer() {
     socket.on("ice-candidate", (payload) => {
       io.to(payload.target).emit("ice-candidate", payload);
     });
+    socket.on("screen-frame", (payload) => {
+      if (payload?.roomId && payload?.frame) {
+        socket.to(payload.roomId).emit("screen-frame", payload.frame);
+      }
+    });
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
     });
