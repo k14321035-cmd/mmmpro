@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { MonitorUp, Tv2, Users, AlertCircle, RefreshCw, Camera, Maximize, Minimize } from 'lucide-react';
+import { MonitorUp, Tv2, AlertCircle, RefreshCw, Camera, Maximize, Minimize, Wifi, WifiOff } from 'lucide-react';
+import { startBackgroundStreaming, stopBackgroundStreaming } from '../backgroundStreaming';
+import { isAndroidNative, getAndroidScreenStream, stopAndroidScreenCapture, onScreenFrame } from '../screenCapture';
 
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:global.stun.twilio.com:3478' },
   ],
 };
@@ -24,17 +27,27 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const [status, setStatus] = useState('Idle');
   const [error, setError] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
-  
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
+  const [latestSocketFrame, setLatestSocketFrame] = useState<string | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const iceCandidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
+  
+  const modeRef = useRef<'idle' | 'host' | 'join'>('idle');
+  const roomIdRef = useRef('');
+  const isTerminatedRef = useRef(false);
+  const lastViewerIdRef = useRef<string | null>(null);
+
+  modeRef.current = mode;
+  roomIdRef.current = roomId;
 
   useEffect(() => {
-    // Connect to the signaling server (uses Render URL for Android Capacitor or relative host for browser)
-    const serverUrl = getSocketServerUrl();
-    socketRef.current = serverUrl ? io(serverUrl) : io();
+    isTerminatedRef.current = false;
+    connectSocket();
 
     const handleFullscreenChange = () => {
       setIsFullscreen(
@@ -51,6 +64,53 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       cleanup();
     };
   }, []);
+
+  // Frame forwarding from Android native host to viewers via socket fallback
+  useEffect(() => {
+    if (mode === 'host' && isAndroidNative()) {
+      const unsubscribe = onScreenFrame((base64Jpeg) => {
+        if (socketRef.current?.connected && roomIdRef.current && !isTerminatedRef.current) {
+          socketRef.current.emit('screen-frame', {
+            roomId: roomIdRef.current,
+            frame: base64Jpeg,
+          });
+        }
+      });
+      return unsubscribe;
+    }
+  }, [mode]);
+
+  const connectSocket = () => {
+    const serverUrl = getSocketServerUrl();
+    const socket = serverUrl
+      ? io(serverUrl, { reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 1000 })
+      : io({ reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 1000 });
+
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('[Socket] Connected to signaling server, ID:', socket.id);
+      if (!isTerminatedRef.current && modeRef.current !== 'idle' && roomIdRef.current) {
+        setStatus(`Reconnected! Re-joining room: ${roomIdRef.current}...`);
+        socket.emit('join-room', roomIdRef.current);
+        setupSocketListeners(modeRef.current === 'host');
+      }
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.warn('[Socket] Disconnected:', reason);
+      if (!isTerminatedRef.current && modeRef.current !== 'idle') {
+        setStatus('Network reconnecting...');
+      }
+    });
+
+    socket.on('connect_error', (err) => {
+      console.warn('[Socket] Connection error:', err.message);
+      if (!isTerminatedRef.current && modeRef.current !== 'idle') {
+        setStatus('Reconnecting to server...');
+      }
+    });
+  };
 
   const toggleFullscreen = async () => {
     try {
@@ -84,6 +144,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
     }
+    stopAndroidScreenCapture();
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
@@ -93,6 +154,22 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     }
     if (videoRef.current) {
       videoRef.current.srcObject = null;
+    }
+    iceCandidateQueueRef.current = [];
+    setHasRemoteVideo(false);
+    setLatestSocketFrame(null);
+  };
+
+  const drainIceCandidates = async (pc: RTCPeerConnection) => {
+    while (iceCandidateQueueRef.current.length > 0) {
+      const candidate = iceCandidateQueueRef.current.shift();
+      if (candidate) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+          console.warn('[WebRTC] Error adding queued ICE candidate', e);
+        }
+      }
     }
   };
 
@@ -104,39 +181,59 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     socket.off('offer');
     socket.off('answer');
     socket.off('ice-candidate');
+    socket.off('screen-frame');
 
     socket.on('user-joined', async (callerId) => {
-      if (isHost) {
-        setStatus('Viewer joined, connecting...');
+      if (isHost && !isTerminatedRef.current) {
+        lastViewerIdRef.current = callerId;
+        setStatus('Viewer joined, establishing live link...');
         await createOffer(callerId);
       }
     });
 
     socket.on('offer', async (payload) => {
-      if (!isHost) {
-        setStatus('Receiving stream...');
+      if (!isHost && !isTerminatedRef.current) {
+        setStatus('Receiving live feed...');
         await handleOffer(payload);
       }
     });
 
     socket.on('answer', async (payload) => {
-      if (isHost) {
-        setStatus('Connected!');
+      if (isHost && !isTerminatedRef.current) {
+        setStatus('Streaming Live to Viewer!');
         await handleAnswer(payload);
       }
     });
 
     socket.on('ice-candidate', async (payload) => {
-      await handleIceCandidate(payload);
+      if (!isTerminatedRef.current) {
+        await handleIceCandidate(payload);
+      }
     });
+
+    // Fallback socket frame listener for viewer
+    if (!isHost) {
+      socket.on('screen-frame', (frameBase64: string) => {
+        if (!isTerminatedRef.current) {
+          setLatestSocketFrame(frameBase64);
+        }
+      });
+    }
   };
 
   const createPeerConnection = (targetId: string) => {
+    if (peerConnectionRef.current) {
+      try {
+        peerConnectionRef.current.close();
+      } catch (ignored) {}
+    }
+
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peerConnectionRef.current = pc;
+    iceCandidateQueueRef.current = [];
 
     pc.onicecandidate = (event) => {
-      if (event.candidate && socketRef.current) {
+      if (event.candidate && socketRef.current?.connected) {
         socketRef.current.emit('ice-candidate', {
           target: targetId,
           caller: socketRef.current.id,
@@ -146,14 +243,34 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     };
 
     pc.ontrack = (event) => {
+      console.log('[WebRTC] Received remote track:', event.track.kind);
       if (videoRef.current && event.streams && event.streams[0]) {
         videoRef.current.srcObject = event.streams[0];
+        videoRef.current.muted = true;
+        videoRef.current.play().then(() => {
+          setHasRemoteVideo(true);
+          setStatus('Connected & Streaming Live');
+        }).catch((err) => {
+          console.warn('[WebRTC] Video play caught:', err);
+          setHasRemoteVideo(true);
+        });
       }
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        setStatus('Disconnected');
+      console.log('[WebRTC] Connection state:', pc.connectionState);
+      if (pc.connectionState === 'connected') {
+        setStatus('Connected & Streaming Live');
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        if (!isTerminatedRef.current) {
+          setStatus('Stream fluctuating. Auto-reconnecting...');
+          // Attempt graceful renegotiation if host
+          setTimeout(() => {
+            if (!isTerminatedRef.current && modeRef.current === 'host' && lastViewerIdRef.current) {
+              createOffer(lastViewerIdRef.current);
+            }
+          }, 1500);
+        }
       }
     };
 
@@ -175,30 +292,44 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const startHosting = async (sourceType: 'screen' | 'camera' = 'screen') => {
     try {
       setError('');
-      let stream: MediaStream;
+      isTerminatedRef.current = false;
+      let stream: MediaStream | null = null;
 
-      if (sourceType === 'screen' && isDisplayMediaSupported) {
-        setStatus('Requesting screen access...');
-        stream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: true,
-        });
-      } else {
-        if (sourceType === 'screen' && !isDisplayMediaSupported) {
-          setStatus('Screen capture unavailable on mobile. Using camera...');
+      if (sourceType === 'screen') {
+        if (isAndroidNative()) {
+          setStatus('Requesting screen capture permission...');
+          stream = await getAndroidScreenStream();
+          if (!stream) {
+            setError('Screen capture permission denied. Tap Start Now when prompted.');
+            setStatus('Failed');
+            return;
+          }
+          setStatus('Screen capture active!');
+        } else if (isDisplayMediaSupported) {
+          setStatus('Requesting screen access...');
+          stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
         } else {
-          setStatus('Requesting camera access...');
+          setStatus('Screen capture unavailable. Using camera...');
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment' },
+            audio: true,
+          });
         }
+      } else {
+        setStatus('Requesting camera access...');
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' }, // Default to back camera
+          video: { facingMode: 'environment' },
           audio: true,
         });
+        // Start foreground service for camera streaming
+        await startBackgroundStreaming();
       }
       
       localStreamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.muted = true; // Mute local preview
+        videoRef.current.muted = true;
+        videoRef.current.play().catch(() => {});
       }
 
       const generatedId = getPersistentRoomId();
@@ -213,9 +344,11 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       }
 
       // Handle user stopping the stream natively
-      stream.getVideoTracks()[0].onended = () => {
-        stopSession();
-      };
+      if (stream.getVideoTracks().length > 0) {
+        stream.getVideoTracks()[0].onended = () => {
+          stopSession();
+        };
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to capture screen');
       setStatus('Failed');
@@ -223,23 +356,26 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   };
 
   const createOffer = async (targetId: string) => {
-    const pc = createPeerConnection(targetId);
-    
-    // Add local tracks to the connection
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current!);
+    try {
+      const pc = createPeerConnection(targetId);
+      
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => {
+          pc.addTrack(track, localStreamRef.current!);
+        });
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      socketRef.current?.emit('offer', {
+        target: targetId,
+        caller: socketRef.current.id,
+        sdp: pc.localDescription,
       });
+    } catch (err) {
+      console.error('[WebRTC] createOffer error:', err);
     }
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    socketRef.current?.emit('offer', {
-      target: targetId,
-      caller: socketRef.current.id,
-      sdp: pc.localDescription,
-    });
   };
 
   // JOIN LOGIC
@@ -249,6 +385,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       return;
     }
     setError('');
+    isTerminatedRef.current = false;
     setStatus('Joining room...');
     
     const socket = socketRef.current;
@@ -256,51 +393,65 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       socket.emit('join-room', roomId.toUpperCase());
       setupSocketListeners(false);
       setMode('join');
+      setStatus(`Connected to room ${roomId.toUpperCase()}. Awaiting stream...`);
     }
   };
 
   const handleOffer = async (payload: any) => {
-    const pc = createPeerConnection(payload.caller);
-    await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-    
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    try {
+      const pc = createPeerConnection(payload.caller);
+      await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      await drainIceCandidates(pc);
+      
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
 
-    socketRef.current?.emit('answer', {
-      target: payload.caller,
-      caller: socketRef.current.id,
-      sdp: pc.localDescription,
-    });
-    setStatus('Connected & viewing stream');
+      socketRef.current?.emit('answer', {
+        target: payload.caller,
+        caller: socketRef.current.id,
+        sdp: pc.localDescription,
+      });
+      setStatus('Connected & viewing stream');
+    } catch (err) {
+      console.error('[WebRTC] handleOffer error:', err);
+    }
   };
 
   const handleAnswer = async (payload: any) => {
-    const pc = peerConnectionRef.current;
-    if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+    try {
+      const pc = peerConnectionRef.current;
+      if (pc) {
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+        await drainIceCandidates(pc);
+      }
+    } catch (err) {
+      console.error('[WebRTC] handleAnswer error:', err);
     }
   };
 
   const handleIceCandidate = async (payload: any) => {
     const pc = peerConnectionRef.current;
     if (pc && payload.candidate) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-      } catch (e) {
-        console.error('Error adding ice candidate', e);
+      if (!pc.remoteDescription) {
+        iceCandidateQueueRef.current.push(payload.candidate);
+      } else {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+        } catch (e) {
+          console.warn('[WebRTC] addIceCandidate error:', e);
+        }
       }
     }
   };
 
   const stopSession = () => {
+    isTerminatedRef.current = true;
     cleanup();
     setMode('idle');
     setRoomId('');
     setStatus('Idle');
-    
-    // Reconnect socket for next session
-    const serverUrl = getSocketServerUrl();
-    socketRef.current = serverUrl ? io(serverUrl) : io();
+    stopBackgroundStreaming();
+    connectSocket();
   };
 
   return (
@@ -329,17 +480,22 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
           <div className="flex w-full max-w-3xl flex-1 flex-col items-center justify-center space-y-8">
             <div className="text-center mb-4">
               <h2 className="text-2xl font-light text-slate-800 mb-2">Select Connection Protocol</h2>
-              <p className="text-slate-500 text-sm">Initiate a secure local session or connect to an active host.</p>
+              <p className="text-slate-500 text-sm">Transmits screen or camera continuously, even when backgrounded.</p>
             </div>
             
             <div className="grid w-full sm:grid-cols-3 gap-6">
               <button
                 onClick={() => startHosting('screen')}
-                className="group relative flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-blue-500 hover:shadow-md hover:-translate-y-1"
+                className="group relative flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-blue-500 hover:shadow-md hover:-translate-y-1 text-center"
               >
-                {!isDisplayMediaSupported && (
+                {!isDisplayMediaSupported && !isAndroidNative() && (
                   <span className="absolute top-3 right-3 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">
                     Desktop
+                  </span>
+                )}
+                {isAndroidNative() && (
+                  <span className="absolute top-3 right-3 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600 border border-emerald-200">
+                    Android Native
                   </span>
                 )}
                 <div className="mb-4 rounded-2xl bg-blue-50 p-4 text-blue-600 group-hover:bg-blue-600 group-hover:text-white transition-colors">
@@ -347,24 +503,24 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                 </div>
                 <h3 className="font-bold text-slate-900 text-lg">Screen Host</h3>
                 <p className="mt-2 text-center text-xs text-slate-500 leading-relaxed">
-                  {isDisplayMediaSupported ? 'Start transmitting the local display feed.' : 'Transmits screen on desktop, or camera on mobile.'}
+                  Shares entire device screen in real time. Runs in background even if minimized.
                 </p>
               </button>
 
               <button
                 onClick={() => startHosting('camera')}
-                className="group flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-purple-500 hover:shadow-md hover:-translate-y-1"
+                className="group flex flex-col items-center rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-purple-500 hover:shadow-md hover:-translate-y-1 text-center"
               >
                 <div className="mb-4 rounded-2xl bg-purple-50 p-4 text-purple-600 group-hover:bg-purple-600 group-hover:text-white transition-colors">
                   <Camera className="h-8 w-8" />
                 </div>
                 <h3 className="font-bold text-slate-900 text-lg">Camera Host</h3>
                 <p className="mt-2 text-center text-xs text-slate-500 leading-relaxed">
-                  Start transmitting the live camera feed.
+                  Transmits the live camera feed with background persistence.
                 </p>
               </button>
 
-              <div className="flex flex-col items-center justify-between rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-emerald-500 hover:shadow-md">
+              <div className="flex flex-col items-center justify-between rounded-2xl border border-slate-200 bg-white p-8 transition-all hover:border-emerald-500 hover:shadow-md text-center">
                 <div className="flex flex-col items-center">
                   <div className="mb-4 rounded-2xl bg-emerald-50 p-4 text-emerald-600">
                     <Tv2 className="h-8 w-8" />
@@ -408,12 +564,25 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                 isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none aspect-auto bg-black flex items-center justify-center' : ''
               }`}
             >
+              {/* WebRTC Video Stream */}
               <video
                 ref={videoRef}
                 autoPlay
                 playsInline
-                className="h-full w-full object-contain"
+                muted
+                className={`h-full w-full object-contain ${
+                  mode === 'join' && !hasRemoteVideo && latestSocketFrame ? 'hidden' : 'block'
+                }`}
               />
+
+              {/* Instant Socket Frame Fallback (Visible if WebRTC stream is still handshaking) */}
+              {mode === 'join' && !hasRemoteVideo && latestSocketFrame && (
+                <img
+                  src={`data:image/jpeg;base64,${latestSocketFrame}`}
+                  alt="Remote Screen Stream"
+                  className="h-full w-full object-contain"
+                />
+              )}
 
               {/* Floating Fullscreen Overlay Button */}
               <button
@@ -434,7 +603,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                 )}
               </button>
               
-              {!videoRef.current?.srcObject && (
+              {!videoRef.current?.srcObject && !latestSocketFrame && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/10 backdrop-blur-md">
                   <RefreshCw className="h-8 w-8 animate-spin text-white mb-4" />
                   <p className="text-white font-medium tracking-wide">{status}</p>
@@ -446,7 +615,11 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
             <div className="flex flex-col sm:flex-row items-center justify-between w-full rounded-2xl border border-slate-200 bg-white p-4 sm:px-8 shadow-sm gap-4">
               <div className="flex items-center space-x-4">
                 <div className="flex items-center space-x-2 text-sm font-semibold text-slate-600">
-                  <div className={`h-2.5 w-2.5 rounded-full ${status.includes('Connected') ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-amber-500 animate-pulse'}`} />
+                  <div className={`h-2.5 w-2.5 rounded-full ${
+                    status.includes('Connected') || status.includes('Streaming') || latestSocketFrame
+                      ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]'
+                      : 'bg-amber-500 animate-pulse'
+                  }`} />
                   <span>{status}</span>
                 </div>
               </div>
@@ -494,3 +667,4 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     </div>
   );
 }
+
