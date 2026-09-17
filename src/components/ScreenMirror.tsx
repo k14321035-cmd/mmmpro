@@ -1,8 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { MonitorUp, Tv2, AlertCircle, RefreshCw, Camera, Maximize, Minimize, Wifi, WifiOff } from 'lucide-react';
-import { startBackgroundStreaming, stopBackgroundStreaming } from '../backgroundStreaming';
-import { isAndroidNative, getAndroidScreenStream, stopAndroidScreenCapture, onScreenFrame } from '../screenCapture';
+import { MonitorUp, Tv2, AlertCircle, RefreshCw, Camera, Maximize, Minimize, Wifi, WifiOff, Layers } from 'lucide-react';
+import { startBackgroundStreaming, stopBackgroundStreaming, onBackgroundStreamingStopped } from '../backgroundStreaming';
+import { 
+  isAndroidNative, 
+  getAndroidScreenStream, 
+  stopAndroidScreenCapture, 
+  onScreenFrame,
+  checkOverlayPermission,
+  requestOverlayPermission,
+  onScreenCaptureStopped
+} from '../screenCapture';
 
 const ICE_SERVERS = {
   iceServers: [
@@ -29,6 +37,8 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
   const [latestSocketFrame, setLatestSocketFrame] = useState<string | null>(null);
+  const [lastSocketFrameTime, setLastSocketFrameTime] = useState<number>(0);
+  const [hasOverlayPermission, setHasOverlayPermission] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -49,6 +59,19 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     isTerminatedRef.current = false;
     connectSocket();
 
+    if (isAndroidNative()) {
+      checkOverlayPermission().then(setHasOverlayPermission);
+    }
+
+    const unCapture = onScreenCaptureStopped(() => {
+      console.log('[ScreenMirror] Screen capture stopped from overlay');
+      stopSession();
+    });
+    const unStream = onBackgroundStreamingStopped(() => {
+      console.log('[ScreenMirror] Background streaming stopped from overlay');
+      stopSession();
+    });
+
     const handleFullscreenChange = () => {
       setIsFullscreen(
         Boolean(document.fullscreenElement || (document as any).webkitFullscreenElement)
@@ -61,6 +84,8 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
       document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
+      unCapture();
+      unStream();
       cleanup();
     };
   }, []);
@@ -211,11 +236,12 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       }
     });
 
-    // Fallback socket frame listener for viewer
+    // Live socket frame listener for viewer
     if (!isHost) {
       socket.on('screen-frame', (frameBase64: string) => {
         if (!isTerminatedRef.current) {
           setLatestSocketFrame(frameBase64);
+          setLastSocketFrameTime(Date.now());
         }
       });
     }
@@ -297,6 +323,12 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
 
       if (sourceType === 'screen') {
         if (isAndroidNative()) {
+          const hasOverlay = await checkOverlayPermission();
+          setHasOverlayPermission(hasOverlay);
+          if (!hasOverlay) {
+            // Prompt overlay permission so floating overlay appears when switching apps like WhatsApp
+            await requestOverlayPermission();
+          }
           setStatus('Requesting screen capture permission...');
           stream = await getAndroidScreenStream();
           if (!stream) {
@@ -482,6 +514,32 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
               <h2 className="text-2xl font-light text-slate-800 mb-2">Select Connection Protocol</h2>
               <p className="text-slate-500 text-sm">Transmits screen or camera continuously, even when backgrounded.</p>
             </div>
+
+            {isAndroidNative() && !hasOverlayPermission && (
+              <div className="flex flex-col sm:flex-row items-center justify-between rounded-2xl bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 p-4 sm:px-6 w-full shadow-sm gap-3">
+                <div className="flex items-center space-x-3">
+                  <div className="p-2.5 bg-blue-600 text-white rounded-xl shadow-sm">
+                    <Layers className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-sm">Enable Floating Overlay (Like WhatsApp)</h4>
+                    <p className="text-slate-600 text-xs mt-0.5">Allows screen & camera to stream continuously when using other apps.</p>
+                  </div>
+                </div>
+                <button
+                  onClick={async () => {
+                    await requestOverlayPermission();
+                    setTimeout(async () => {
+                      const granted = await checkOverlayPermission();
+                      setHasOverlayPermission(granted);
+                    }, 1000);
+                  }}
+                  className="rounded-xl bg-blue-600 px-4 py-2 text-xs font-bold text-white hover:bg-blue-700 transition-colors shadow-sm shrink-0 whitespace-nowrap"
+                >
+                  Enable Overlay
+                </button>
+              </div>
+            )}
             
             <div className="grid w-full sm:grid-cols-3 gap-6">
               <button
@@ -564,24 +622,41 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                 isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none aspect-auto bg-black flex items-center justify-center' : ''
               }`}
             >
-              {/* WebRTC Video Stream */}
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className={`h-full w-full object-contain ${
-                  mode === 'join' && !hasRemoteVideo && latestSocketFrame ? 'hidden' : 'block'
-                }`}
-              />
+              {/* Direct Native Screen Stream (from Android MediaProjection via Socket) */}
+              {mode === 'join' && latestSocketFrame && (Date.now() - lastSocketFrameTime < 4000) ? (
+                <img
+                  src={`data:image/jpeg;base64,${latestSocketFrame}`}
+                  alt="Live Mobile Screen"
+                  className="h-full w-full object-contain select-none"
+                />
+              ) : (
+                /* WebRTC Video Stream */
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`h-full w-full object-contain ${
+                    mode === 'join' && !hasRemoteVideo && latestSocketFrame ? 'hidden' : 'block'
+                  }`}
+                />
+              )}
 
-              {/* Instant Socket Frame Fallback (Visible if WebRTC stream is still handshaking) */}
-              {mode === 'join' && !hasRemoteVideo && latestSocketFrame && (
+              {/* Instant Socket Frame Fallback if WebRTC is waiting */}
+              {mode === 'join' && !hasRemoteVideo && latestSocketFrame && !(Date.now() - lastSocketFrameTime < 4000) && (
                 <img
                   src={`data:image/jpeg;base64,${latestSocketFrame}`}
                   alt="Remote Screen Stream"
                   className="h-full w-full object-contain"
                 />
+              )}
+
+              {/* Live Badge for Direct Screen Stream */}
+              {mode === 'join' && latestSocketFrame && (Date.now() - lastSocketFrameTime < 4000) && (
+                <div className="absolute top-4 left-4 z-20 flex items-center space-x-2 rounded-xl bg-black/70 backdrop-blur-md px-3 py-1.5 text-xs font-semibold text-emerald-400 border border-emerald-500/30 shadow-lg">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                  <span>Live Mobile Screen (8 FPS)</span>
+                </div>
               )}
 
               {/* Floating Fullscreen Overlay Button */}

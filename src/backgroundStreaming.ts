@@ -13,6 +13,10 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 interface BackgroundStreamingPlugin {
   startStreaming(): Promise<{ started: boolean }>;
   stopStreaming(): Promise<{ stopped: boolean }>;
+  addListener(
+    event: 'streamingStopped',
+    listener: () => void
+  ): Promise<{ remove: () => void }>;
 }
 
 const BackgroundStreaming = registerPlugin<BackgroundStreamingPlugin>('BackgroundStreaming', {
@@ -20,6 +24,7 @@ const BackgroundStreaming = registerPlugin<BackgroundStreamingPlugin>('Backgroun
   web: {
     startStreaming: async () => ({ started: true }),
     stopStreaming: async () => ({ stopped: true }),
+    addListener: async (_event: string, _listener: any) => ({ remove: () => {} }),
   },
 });
 
@@ -43,4 +48,20 @@ export const stopBackgroundStreaming = async () => {
       console.warn('[BackgroundStreaming] Failed to stop service:', e);
     }
   }
+};
+
+export const onBackgroundStreamingStopped = (callback: () => void) => {
+  if (!Capacitor.isNativePlatform()) return () => {};
+  let listenerHandle: { remove: () => void } | null = null;
+  BackgroundStreaming.addListener('streamingStopped', () => {
+    callback();
+  }).then((handle) => {
+    listenerHandle = handle;
+  });
+
+  return () => {
+    if (listenerHandle) {
+      listenerHandle.remove();
+    }
+  };
 };

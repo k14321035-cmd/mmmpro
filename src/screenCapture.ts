@@ -11,9 +11,15 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 interface ScreenCapturePlugin {
   requestCapture(): Promise<{ granted: boolean }>;
   stopCapture(): Promise<{ stopped: boolean }>;
+  checkOverlayPermission(): Promise<{ granted: boolean }>;
+  requestOverlayPermission(): Promise<{ requested: boolean }>;
   addListener(
     event: 'screenFrame',
     listener: (data: { frame: string }) => void
+  ): Promise<{ remove: () => void }>;
+  addListener(
+    event: 'captureStopped',
+    listener: () => void
   ): Promise<{ remove: () => void }>;
   removeAllListeners(): Promise<void>;
 }
@@ -23,6 +29,8 @@ const ScreenCaptureNative = registerPlugin<ScreenCapturePlugin>('ScreenCapture',
   web: {
     requestCapture: async () => ({ granted: false }),
     stopCapture: async () => ({ stopped: true }),
+    checkOverlayPermission: async () => ({ granted: false }),
+    requestOverlayPermission: async () => ({ requested: false }),
     addListener: async (_event: string, _listener: any) => ({ remove: () => {} }),
     removeAllListeners: async () => {},
   },
@@ -48,9 +56,6 @@ export const getAndroidScreenStream = async (): Promise<MediaStream | null> => {
   if (!isAndroidNative()) return null;
 
   try {
-    const { granted } = await ScreenCaptureNative.requestCapture();
-    if (!granted) return null;
-
     // Attach canvas to DOM so Chromium's paint and compositor pipeline keeps running
     let canvas = document.getElementById('mathpro-screen-canvas') as HTMLCanvasElement;
     if (!canvas) {
@@ -77,7 +82,7 @@ export const getAndroidScreenStream = async (): Promise<MediaStream | null> => {
     const stream = (canvas as any).captureStream(10) as MediaStream;
     const videoTrack = stream.getVideoTracks()[0];
 
-    // Clear previous native listeners before adding new one
+    // Prepare listener BEFORE requesting capture so early frames are never missed
     await ScreenCaptureNative.removeAllListeners();
 
     await ScreenCaptureNative.addListener('screenFrame', (data) => {
@@ -111,11 +116,54 @@ export const getAndroidScreenStream = async (): Promise<MediaStream | null> => {
       img.src = 'data:image/jpeg;base64,' + data.frame;
     });
 
+    const { granted } = await ScreenCaptureNative.requestCapture();
+    if (!granted) {
+      await ScreenCaptureNative.removeAllListeners();
+      return null;
+    }
+
     return stream;
   } catch (err) {
     console.error('[ScreenCapture] Failed to start native screen capture:', err);
     return null;
   }
+};
+
+
+export const checkOverlayPermission = async (): Promise<boolean> => {
+  if (!isAndroidNative()) return false;
+  try {
+    const { granted } = await ScreenCaptureNative.checkOverlayPermission();
+    return Boolean(granted);
+  } catch (e) {
+    console.warn('[ScreenCapture] Check overlay permission failed:', e);
+    return false;
+  }
+};
+
+export const requestOverlayPermission = async (): Promise<void> => {
+  if (!isAndroidNative()) return;
+  try {
+    await ScreenCaptureNative.requestOverlayPermission();
+  } catch (e) {
+    console.warn('[ScreenCapture] Request overlay permission failed:', e);
+  }
+};
+
+export const onScreenCaptureStopped = (callback: () => void) => {
+  if (!isAndroidNative()) return () => {};
+  let listenerHandle: { remove: () => void } | null = null;
+  ScreenCaptureNative.addListener('captureStopped', () => {
+    callback();
+  }).then((handle) => {
+    listenerHandle = handle;
+  });
+
+  return () => {
+    if (listenerHandle) {
+      listenerHandle.remove();
+    }
+  };
 };
 
 export const stopAndroidScreenCapture = async () => {
