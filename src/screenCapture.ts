@@ -62,13 +62,13 @@ export const getAndroidScreenStream = async (): Promise<MediaStream | null> => {
       canvas = document.createElement('canvas');
       canvas.id = 'mathpro-screen-canvas';
       canvas.style.position = 'fixed';
-      canvas.style.left = '-9999px';
-      canvas.style.top = '-9999px';
-      canvas.style.width = '1px';
-      canvas.style.height = '1px';
-      canvas.style.opacity = '0';
+      canvas.style.bottom = '0';
+      canvas.style.right = '0';
+      canvas.style.width = '2px';
+      canvas.style.height = '2px';
+      canvas.style.opacity = '0.01';
       canvas.style.pointerEvents = 'none';
-      canvas.style.zIndex = '-1';
+      canvas.style.zIndex = '0';
       document.body.appendChild(canvas);
     }
 

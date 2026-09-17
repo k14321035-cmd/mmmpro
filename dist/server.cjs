@@ -30,7 +30,8 @@ async function startServer() {
   const app = (0, import_express.default)();
   const httpServer = (0, import_http.createServer)(app);
   const io = new import_socket.Server(httpServer, {
-    cors: { origin: "*" }
+    cors: { origin: "*" },
+    maxHttpBufferSize: 1e7
   });
   const PORT = Number(process.env.PORT) || 3e3;
   io.on("connection", (socket) => {

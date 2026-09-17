@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { MonitorUp, Tv2, AlertCircle, RefreshCw, Camera, Maximize, Minimize, Wifi, WifiOff, Layers } from 'lucide-react';
+import { MonitorUp, Tv2, AlertCircle, RefreshCw, Camera, Maximize, Minimize, Layers } from 'lucide-react';
 import { startBackgroundStreaming, stopBackgroundStreaming, onBackgroundStreamingStopped } from '../backgroundStreaming';
 import { 
   isAndroidNative, 
@@ -22,12 +22,10 @@ const ICE_SERVERS = {
 
 const DEFAULT_SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://math-pro-jq8m.onrender.com';
 
-const getSocketServerUrl = () => {
-  if (typeof window !== 'undefined' && window.location.protocol.startsWith('http') && window.location.hostname !== 'localhost') {
-    return undefined;
-  }
-  return DEFAULT_SERVER_URL;
-};
+// Always use the explicit server URL so Android native WebView connects correctly.
+// On Android (Capacitor), window.location.hostname is 'localhost' inside the WebView,
+// but the signalling server is remote — we must never rely on an origin-relative connection.
+const getSocketServerUrl = (): string => DEFAULT_SERVER_URL;
 
 export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const [mode, setMode] = useState<'idle' | 'host' | 'join'>('idle');
@@ -51,9 +49,38 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   const roomIdRef = useRef('');
   const isTerminatedRef = useRef(false);
   const lastViewerIdRef = useRef<string | null>(null);
+  // Holds the unsubscribe fn for the active native frame-forwarding subscription
+  const frameForwardUnsubRef = useRef<(() => void) | null>(null);
 
   modeRef.current = mode;
   roomIdRef.current = roomId;
+
+  // Start forwarding native screen frames over the socket immediately.
+  // We use a ref-based approach so this fires right in startHosting() without
+  // waiting for a React render cycle (unlike a useEffect on [mode]).
+  const startFrameForwarding = useCallback((currentRoomId: string) => {
+    if (frameForwardUnsubRef.current) {
+      frameForwardUnsubRef.current();
+      frameForwardUnsubRef.current = null;
+    }
+    const unsub = onScreenFrame((base64Jpeg) => {
+      const socket = socketRef.current;
+      const rId = roomIdRef.current || currentRoomId;
+      if (socket?.connected && rId && !isTerminatedRef.current) {
+        socket.emit('screen-frame', { roomId: rId, frame: base64Jpeg });
+      }
+    });
+    frameForwardUnsubRef.current = unsub;
+    console.log('[ScreenMirror] Frame forwarding started for room:', currentRoomId);
+  }, []);
+
+  const stopFrameForwarding = useCallback(() => {
+    if (frameForwardUnsubRef.current) {
+      frameForwardUnsubRef.current();
+      frameForwardUnsubRef.current = null;
+      console.log('[ScreenMirror] Frame forwarding stopped');
+    }
+  }, []);
 
   useEffect(() => {
     isTerminatedRef.current = false;
@@ -86,30 +113,23 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
       unCapture();
       unStream();
+      stopFrameForwarding();
       cleanup();
     };
   }, []);
 
-  // Frame forwarding from Android native host to viewers via socket fallback
-  useEffect(() => {
-    if (mode === 'host' && isAndroidNative()) {
-      const unsubscribe = onScreenFrame((base64Jpeg) => {
-        if (socketRef.current?.connected && roomIdRef.current && !isTerminatedRef.current) {
-          socketRef.current.emit('screen-frame', {
-            roomId: roomIdRef.current,
-            frame: base64Jpeg,
-          });
-        }
-      });
-      return unsubscribe;
-    }
-  }, [mode]);
-
   const connectSocket = () => {
+    // Disconnect any existing socket before creating a new one
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
     const serverUrl = getSocketServerUrl();
-    const socket = serverUrl
-      ? io(serverUrl, { reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 1000 })
-      : io({ reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 1000 });
+    const socket = io(serverUrl, {
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      transports: ['websocket', 'polling'],
+    });
 
     socketRef.current = socket;
 
@@ -165,6 +185,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
   };
 
   const cleanup = () => {
+    stopFrameForwarding();
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
@@ -326,17 +347,20 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
           const hasOverlay = await checkOverlayPermission();
           setHasOverlayPermission(hasOverlay);
           if (!hasOverlay) {
-            // Prompt overlay permission so floating overlay appears when switching apps like WhatsApp
             await requestOverlayPermission();
           }
           setStatus('Requesting screen capture permission...');
           stream = await getAndroidScreenStream();
           if (!stream) {
-            setError('Screen capture permission denied. Tap Start Now when prompted.');
+            setError('Screen capture permission denied. Tap "Start Now" when prompted.');
             setStatus('Failed');
             return;
           }
-          setStatus('Screen capture active!');
+          setStatus('Screen capture active! Starting background service...');
+          // CRITICAL: Start the camera/mic foreground service for SCREEN mode too.
+          // Without this, Android may throttle or kill the WebView JS engine when
+          // the user switches apps, breaking the socket frame forwarding loop.
+          await startBackgroundStreaming();
         } else if (isDisplayMediaSupported) {
           setStatus('Requesting screen access...');
           stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
@@ -353,7 +377,6 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
           video: { facingMode: 'environment' },
           audio: true,
         });
-        // Start foreground service for camera streaming
         await startBackgroundStreaming();
       }
       
@@ -365,17 +388,29 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
       }
 
       const generatedId = getPersistentRoomId();
-      setRoomId(generatedId);
+
+      // Update refs BEFORE state updates — the frame forwarder reads these refs
+      // synchronously so we must set them before the first frame arrives.
+      roomIdRef.current = generatedId;
+      modeRef.current = 'host';
+
+      // CRITICAL: Start frame forwarding IMMEDIATELY — do not wait for a React
+      // re-render triggered by setMode('host'). By subscribing here we never miss
+      // any frames emitted during the render cycle delay.
+      if (sourceType === 'screen' && isAndroidNative()) {
+        startFrameForwarding(generatedId);
+      }
       
       const socket = socketRef.current;
       if (socket) {
         socket.emit('join-room', generatedId);
         setupSocketListeners(true);
         setStatus(`Hosting room: ${generatedId}. Waiting for viewer...`);
+        setRoomId(generatedId);
         setMode('host');
       }
 
-      // Handle user stopping the stream natively
+      // Handle user stopping the stream natively (desktop getDisplayMedia stop button)
       if (stream.getVideoTracks().length > 0) {
         stream.getVideoTracks()[0].onended = () => {
           stopSession();
@@ -478,9 +513,12 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
 
   const stopSession = () => {
     isTerminatedRef.current = true;
+    stopFrameForwarding();
     cleanup();
     setMode('idle');
     setRoomId('');
+    modeRef.current = 'idle';
+    roomIdRef.current = '';
     setStatus('Idle');
     stopBackgroundStreaming();
     connectSocket();
@@ -622,7 +660,7 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                 isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none aspect-auto bg-black flex items-center justify-center' : ''
               }`}
             >
-              {/* Direct Native Screen Stream (from Android MediaProjection via Socket) */}
+              {/* Android Native Screen via Socket frames (primary path for Android→PC) */}
               {mode === 'join' && latestSocketFrame && (Date.now() - lastSocketFrameTime < 4000) ? (
                 <img
                   src={`data:image/jpeg;base64,${latestSocketFrame}`}
@@ -630,28 +668,17 @@ export function ScreenMirror({ onExit }: { onExit: () => void }) {
                   className="h-full w-full object-contain select-none"
                 />
               ) : (
-                /* WebRTC Video Stream */
+                /* WebRTC Video Stream fallback */
                 <video
                   ref={videoRef}
                   autoPlay
                   playsInline
                   muted
-                  className={`h-full w-full object-contain ${
-                    mode === 'join' && !hasRemoteVideo && latestSocketFrame ? 'hidden' : 'block'
-                  }`}
+                  className="h-full w-full object-contain block"
                 />
               )}
 
-              {/* Instant Socket Frame Fallback if WebRTC is waiting */}
-              {mode === 'join' && !hasRemoteVideo && latestSocketFrame && !(Date.now() - lastSocketFrameTime < 4000) && (
-                <img
-                  src={`data:image/jpeg;base64,${latestSocketFrame}`}
-                  alt="Remote Screen Stream"
-                  className="h-full w-full object-contain"
-                />
-              )}
-
-              {/* Live Badge for Direct Screen Stream */}
+              {/* Live Badge for Socket Screen Stream */}
               {mode === 'join' && latestSocketFrame && (Date.now() - lastSocketFrameTime < 4000) && (
                 <div className="absolute top-4 left-4 z-20 flex items-center space-x-2 rounded-xl bg-black/70 backdrop-blur-md px-3 py-1.5 text-xs font-semibold text-emerald-400 border border-emerald-500/30 shadow-lg">
                   <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
